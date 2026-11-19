@@ -4,7 +4,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from database import connect
-from intake.registry import accept_segment, get_accepted_piece, initialize_intake
+from intake.registry import (
+    accept_interval_segment, accept_segment, get_accepted_piece, initialize_intake,
+)
 from ledger.ingest import record_segment
 from ledger.query import get_revision
 from ledger.storage import initialize_ledger
@@ -12,15 +14,16 @@ from plan.catalog import get_task, initialize_catalog, install_task_snapshot
 from plan.layout import SegmentLayout
 from plan.rationals import rational_text
 from plan.tasks import open_task
-from review.history import get_review
-from review.issue import issue_review
+from review.history import get_interval_review, get_review
+from review.issue import issue_interval_review, issue_review
 from review.storage import initialize_review
-from station.export import export_segment
-from station.freeze import freeze_segment
+from station.export import export_interval_segment, export_segment
+from station.freeze import freeze_interval_segment, freeze_segment
 from station.storage import initialize_station
 
 
 SAMPLE = Path(__file__).resolve().parent / 'examples' / 'day_shift.json'
+INTERVAL_SAMPLE = Path(__file__).resolve().parent / 'examples' / 'interval_shift.json'
 
 
 def checked(actual, expected):
@@ -145,10 +148,114 @@ def run(root, data):
         )
 
 
+def interval_counts(result):
+    return {'reachable_counts': list(result.reachable_counts)}
+
+
+def interval_provenance(result):
+    return {
+        'report_id': result.report_id,
+        'task_id': result.task_id,
+        'acceptances': [result.front_id, result.back_id],
+        'revisions': [result.front_source.revision_id, result.back_source.revision_id],
+        'receipt': [result.receipt.report_id, result.receipt.task_id],
+    }
+
+
+def receive_interval_station(path, origin, snapshot, slot, rows, *, parent_id=None):
+    with closing(connect(path)) as db:
+        initialize_catalog(db)
+        initialize_ledger(db, origin)
+        initialize_station(db)
+        install_task_snapshot(db, snapshot)
+        samples = [(row[0], row[1]) for row in rows]
+        revision = record_segment(db, snapshot.task_id, slot, samples, parent_id=parent_id)
+        spans = [(row[0], row[2], row[3]) for row in rows]
+        piece = freeze_interval_segment(db, revision, spans)
+        return revision, export_interval_segment(db, piece)
+
+
+def run_intervals(root):
+    cases = json.loads(INTERVAL_SAMPLE.read_text(encoding='utf-8'))
+    case = next(item for item in cases if item['case'] == 'two_counts')
+    front_rows = [tuple(row) for row in case['front']]
+    back_rows = [tuple(row) for row in case['back']]
+    segments = (
+        SegmentLayout(1, 'west', 'W1', tuple(row[0] for row in front_rows)),
+        SegmentLayout(2, 'east', 'E1', tuple(row[0] for row in back_rows)),
+    )
+    west_path = root / 'interval-west.sqlite'
+    east_path = root / 'interval-east.sqlite'
+    center_path = root / 'interval-center.sqlite'
+    with closing(connect(center_path)) as center:
+        initialize_catalog(center)
+        initialize_intake(center)
+        initialize_review(center)
+        task_id = open_task(
+            center, f"榆湾夜班区间复核 {case['case']}", 'kN',
+            case['threshold'], case['max_change'], segments,
+        )
+        snapshot = get_task(center, task_id)
+        front_revision, front_wire = receive_interval_station(west_path, 'west', snapshot, 1, front_rows)
+        back_revision, back_wire = receive_interval_station(east_path, 'east', snapshot, 2, back_rows)
+        front_id = accept_interval_segment(center, front_wire)
+        back_id = accept_interval_segment(center, back_wire)
+        report, receipt = issue_interval_review(center, task_id, front_id, back_id)
+        checked((receipt.report_id, receipt.task_id), (report, task_id))
+        original = get_interval_review(center, report)
+        checked(original.reachable_counts, case['reachable_counts'])
+        original_provenance = interval_provenance(original)
+        emit(
+            'interval_offline',
+            {'case': case['case'], 'threshold': case['threshold'], 'max_change': case['max_change'],
+             'front': case['front'], 'back': case['back'], 'stations_closed': True},
+            {'reachable_counts': case['reachable_counts']}, interval_counts(original),
+            original_provenance, interval_provenance(original),
+            ['station/intervals.py', 'station/freeze.py', 'intake/registry.py',
+             'review/interval_join.py', 'review/history.py'],
+            '两站关闭后中心只凭 V2 证据核定：前段末拍 [0,1] 与后段首拍 [1,1] 的接缝可计 0 或 1 次，整程可达 [0,1]。',
+        )
+
+        corrected_revision, corrected_wire = receive_interval_station(
+            west_path, 'west', snapshot, 1, [(0, 1, 1, 1)], parent_id=front_revision,
+        )
+        corrected_id = accept_interval_segment(center, corrected_wire)
+        new_report, new_receipt = issue_interval_review(center, task_id, corrected_id, back_id)
+        checked((new_receipt.report_id, new_receipt.task_id), (new_report, task_id))
+        corrected = get_interval_review(center, new_report)
+        checked(corrected.reachable_counts, [0])
+        if report == new_report or front_id == corrected_id:
+            raise AssertionError('corrected interval revision requires distinct identities')
+        corrected_provenance = interval_provenance(corrected)
+
+    with closing(connect(center_path)) as reopened:
+        old = get_interval_review(reopened, report)
+        new = get_interval_review(reopened, new_report)
+        checked(old.reachable_counts, case['reachable_counts'])
+        checked((old.front_id, old.back_id), (front_id, back_id))
+        checked((old.front_source.revision_id, old.back_source.revision_id),
+                (front_revision, back_revision))
+        checked(new.reachable_counts, [0])
+        checked(new.front_source.revision_id, corrected_revision)
+        emit(
+            'interval_correction',
+            {'old_report': report, 'new_report': new_report, 'corrected_front': [[0, 1, 1, 1]]},
+            {'old': {'reachable_counts': case['reachable_counts']}, 'new': {'reachable_counts': [0]}},
+            {'old': interval_counts(old), 'new': interval_counts(new)},
+            {'old': original_provenance, 'new': corrected_provenance},
+            {'old': interval_provenance(old), 'new': interval_provenance(new)},
+            ['ledger/ingest.py', 'station/freeze.py', 'review/issue.py',
+             'review/storage.py', 'review/history.py'],
+            '前站另记修订并把区间固定为 1 后另签 [0]；重开中心按原号领取旧报告 [0,1] 及其原选件。',
+        )
+
+
 def main():
     data = json.loads(SAMPLE.read_text(encoding='utf-8'))
     with TemporaryDirectory(prefix='yuwan-demo-') as folder:
-        run(Path(folder), data)
+        root = Path(folder)
+        run(root, data)
+        run_intervals(root)
 
 
 if __name__ == '__main__':
