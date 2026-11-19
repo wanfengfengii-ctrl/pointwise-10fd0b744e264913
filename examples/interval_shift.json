@@ -1,0 +1,10 @@
+[
+  {"case":"seam_filters_local_count","threshold":1,"max_change":1,"front":[[0,0,0,0],[1,0,0,1]],"back":[[2,2,2,2]],"reachable_counts":[1]},
+  {"case":"same_readings_tight","threshold":1,"max_change":1,"front":[[0,0,0,0],[1,0,0,0]],"back":[[2,2,2,2]],"reachable_counts":[]},
+  {"case":"two_counts","threshold":1,"max_change":1,"front":[[0,0,0,1]],"back":[[1,1,1,1]],"reachable_counts":[0,1]},
+  {"case":"single_up","threshold":1,"max_change":1,"front":[[0,0,0,0]],"back":[[1,1,1,2]],"reachable_counts":[1]},
+  {"case":"single_down","threshold":1,"max_change":1,"front":[[0,1,1,1]],"back":[[1,0,0,0]],"reachable_counts":[0]},
+  {"case":"equal_only","threshold":1,"max_change":0,"front":[[0,0,0,1]],"back":[[1,0,0,1]],"reachable_counts":[0]},
+  {"case":"interior_only","threshold":1,"max_change":"1/4","front":[[0,0,0,2]],"back":[[1,"3/2","3/2","3/2"]],"reachable_counts":[0]},
+  {"case":"local_empty","threshold":1,"max_change":1,"front":[[0,0,0,0],[1,3,3,3]],"back":[[2,3,3,3]],"reachable_counts":[]}
+]
